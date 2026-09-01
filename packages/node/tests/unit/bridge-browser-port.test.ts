@@ -90,7 +90,18 @@ describe("ChatGPTBrowserPort", () => {
     await expect(port.composePrompt("   ")).rejects.toThrow("nonempty");
   });
 
-  it("verifies the prepared composer envelope without activating Send", async () => {
+  it("replaces an existing text draft with the exact requested prompt", async () => {
+    const page = new FakePage("https://chatgpt.com/");
+    page.composer = "unrelated draft";
+    const port = new ChatGPTBrowserPort({ page });
+
+    await port.bindThread("current");
+    await port.composePrompt("exact requested prompt");
+
+    expect(page.composer).toBe("exact requested prompt");
+  });
+
+  it("computes prompt presentation hashes without a pre-Send composer gate", async () => {
     const page = new FakePage("https://chatgpt.com/");
     page.cdpSupported = true;
     const port = new ChatGPTBrowserPort({ page });
@@ -176,7 +187,6 @@ describe("ChatGPTBrowserPort", () => {
   it("submits one 5,258-character multiline prompt without cloning the plain editor", async () => {
     const page = new FakePage("https://chatgpt.com/");
     page.cdpSupported = true;
-    page.requireLiveMultilinePromptRead = true;
     const port = new ChatGPTBrowserPort({ page });
     const prompt = `${"a".repeat(2_600)}\n\n${"b".repeat(2_656)}`;
     page.renderedOnSend = prompt;
@@ -197,7 +207,7 @@ describe("ChatGPTBrowserPort", () => {
     expect(page.sendClicks).toBe(1);
   });
 
-  it("refuses an unrequested staged attachment during prepared-envelope verification", async () => {
+  it("does not revalidate composer state while computing prompt presentation hashes", async () => {
     const page = new FakePage("https://chatgpt.com/");
     page.cdpSupported = true;
     const port = new ChatGPTBrowserPort({ page });
@@ -206,7 +216,7 @@ describe("ChatGPTBrowserPort", () => {
     page.attachmentNames = ["manual-secret.txt"];
 
     await expect(port.submissionPresentationSha256s("prompt-only request"))
-      .rejects.toThrow("composer envelope");
+      .resolves.toHaveLength(2);
     expect(page.sendClicks).toBe(0);
   });
 
@@ -238,7 +248,7 @@ describe("ChatGPTBrowserPort", () => {
     expect(second.tabId).toBe("fresh-2");
   });
 
-  it("reuses one exact pristine target-preflight tab for the following new thread", async () => {
+  it("reuses one exact zero-turn target-preflight tab for the following new thread", async () => {
     let next = 0;
     const pages: FakePage[] = [];
     const create = vi.fn(async () => {
@@ -270,7 +280,7 @@ describe("ChatGPTBrowserPort", () => {
     expect(pages[0]?.powerMenuVisible).toBe(false);
   });
 
-  it("reuses the same pristine tab after a reversible Power inspection failure", async () => {
+  it("reuses the same zero-turn tab after a reversible Power inspection failure", async () => {
     const page = new FakePage("https://chatgpt.com/");
     page.id = "retry-preflight";
     page.throwBeforePowerOpen = true;
@@ -409,7 +419,7 @@ describe("ChatGPTBrowserPort", () => {
     expect(page.powerOpenerClicks).toBe(2);
   });
 
-  it("waits boundedly when a pristine inspected tab is transiently reloading", async () => {
+  it("waits boundedly when a zero-turn inspected tab is transiently reloading", async () => {
     const page = new FakePage("https://chatgpt.com/");
     page.id = "preflight-reload";
     const create = vi.fn(async () => page);
@@ -471,15 +481,31 @@ describe("ChatGPTBrowserPort", () => {
     expect(pages[0]?.composer).toBe("manual draft");
   });
 
-  it("does not reuse or overwrite a zero-turn inspected page after a draft appears", async () => {
+  it("reuses a zero-turn inspected page and replaces a draft with the requested prompt", async () => {
     const page = new FakePage("https://chatgpt.com/");
     const port = new ChatGPTBrowserPort({ page });
 
     await port.inspectTargets();
     page.composer = "manual draft";
 
-    await expect(port.bindThread("new")).rejects.toThrow("no longer a zero-turn home page");
-    expect(page.composer).toBe("manual draft");
+    await expect(port.bindThread("new")).resolves.toMatchObject({ tabId: "tab-1" });
+    await port.composePrompt("bridge request");
+    expect(page.composer).toBe("bridge request");
+  });
+
+  it("preflights and binds a fresh zero-turn tab even when ChatGPT restores draft text", async () => {
+    const page = new FakePage("https://chatgpt.com/");
+    page.id = "restored-draft";
+    page.composer = "restored by ChatGPT";
+    const create = vi.fn(async () => page);
+    const port = new ChatGPTBrowserPort({ browser: { tabs: { create } } });
+
+    await expect(port.inspectTargets()).resolves.toMatchObject({ active: { power: "Instant" } });
+    await expect(port.bindThread("new")).resolves.toMatchObject({ tabId: "restored-draft" });
+    await port.composePrompt("exact bridge request");
+
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(page.composer).toBe("exact bridge request");
   });
 
   it("activates Send once and records the exact rendered user-turn hash", async () => {
@@ -506,7 +532,7 @@ describe("ChatGPTBrowserPort", () => {
     expect(page.sendKeyPresses).toBe(0);
   });
 
-  it("submits once through the exact background form action", async () => {
+  it("clicks the visible Send control once without a CDP envelope predicate", async () => {
     const prompt = "front-bound semantic submission";
     const page = new FakePage("https://chatgpt.com/");
     page.cdpSupported = true;
@@ -525,9 +551,7 @@ describe("ChatGPTBrowserPort", () => {
 
     expect(page.sendClicks).toBe(1);
     expect(page.sendKeyPresses).toBe(0);
-    expect(page.cdpCommands).toEqual([
-      "Runtime.evaluate:"
-    ]);
+    expect(page.cdpCommands).toEqual([]);
   });
 
   it("discovers Power beside attachments and still activates Send exactly once", async () => {
@@ -606,8 +630,8 @@ describe("ChatGPTBrowserPort", () => {
     ["route", (page: FakePage) => { page.currentUrl = "https://chatgpt.com/c/other"; }],
     ["user baseline", (page: FakePage) => { page.users = ["intervening user"]; }],
     ["assistant baseline", (page: FakePage) => { page.assistants = ["intervening answer"]; }]
-  ])("atomically refuses a changed %s envelope before requestSubmit", async (_name, mutate) => {
-    const prompt = "atomic request";
+  ])("does not gate Send on a changed %s composer snapshot", async (_name, mutate) => {
+    const prompt = "direct request";
     const page = new FakePage("https://chatgpt.com/");
     page.cdpSupported = true;
     const port = new ChatGPTBrowserPort({ page }, { acknowledgementTimeoutMs: 2, pollMs: 1 });
@@ -621,11 +645,11 @@ describe("ChatGPTBrowserPort", () => {
       userTurnBefore: 0,
       assistantTurnBefore: 0
     })).resolves.toMatchObject({ confirmed: false });
-    expect(page.sendClicks).toBe(0);
+    expect(page.sendClicks).toBe(1);
   });
 
-  it("atomically refuses a changed requested Power echo before requestSubmit", async () => {
-    const prompt = "atomic Power request";
+  it("does not revalidate a requested Power echo before Send", async () => {
+    const prompt = "direct Power request";
     const page = new FakePage("https://chatgpt.com/");
     page.cdpSupported = true;
     page.composer = prompt;
@@ -639,7 +663,7 @@ describe("ChatGPTBrowserPort", () => {
       assistantTurnBefore: 0,
       power: "Pro"
     })).resolves.toMatchObject({ confirmed: false });
-    expect(page.sendClicks).toBe(0);
+    expect(page.sendClicks).toBe(1);
   });
 
   it("does not claim a different user turn that appears after Send", async () => {
@@ -935,7 +959,6 @@ class FakePage implements BrowserPage {
   cdpSupported = false;
   cdpCommands: string[] = [];
   powerSliderPresses = 0;
-  requireLiveMultilinePromptRead = false;
   throwBeforePowerClose = false;
   throwBeforePowerOpen = false;
   throwAfterPowerClose = false;
@@ -971,48 +994,6 @@ class FakePage implements BrowserPage {
           expect(options).toEqual({ timeoutMs: 10_000 });
           const type = String(params?.type ?? "");
           this.cdpCommands.push(`${method}:${type}`);
-          if (method === "Runtime.evaluate") {
-            const expression = String(params?.expression);
-            expect(expression).toContain("requestSubmit");
-            const serialized = /const expected = (\{[^\n]+\});/.exec(expression)?.[1];
-            if (serialized === undefined) throw new Error("Atomic expectation was not serialized.");
-            const expected = JSON.parse(serialized) as {
-              url: string;
-              prompt: string;
-              attachmentNames: string[];
-              toolLabels: string[];
-              power?: string;
-              activate: boolean;
-              userTurnBefore?: number;
-              assistantTurnBefore?: number;
-              lastUserTurnId?: string;
-              lastAssistantTurnId?: string;
-            };
-            const preservesPlainMultilineBlocks = !this.requireLiveMultilinePromptRead
-              || (expression.includes("inlineSelectionPills.length === 0")
-                && expression.includes("readContentEditableText(editor)"));
-            const matches = expected.url === this.currentUrl
-              && expected.prompt === this.composer
-              && preservesPlainMultilineBlocks
-              && JSON.stringify(expected.attachmentNames) === JSON.stringify(this.attachmentNames)
-              && JSON.stringify([...expected.toolLabels].sort()) === JSON.stringify([...this.activeToolLabels].sort())
-              && (expected.power === undefined || expected.power === this.powerLabel)
-              && (expected.userTurnBefore === undefined || expected.userTurnBefore === this.users.length)
-              && (expected.assistantTurnBefore === undefined
-                || expected.assistantTurnBefore === this.assistants.length)
-              && (expected.lastUserTurnId === undefined
-                || expected.lastUserTurnId === this.userTurnIds.at(-1))
-              && (expected.lastAssistantTurnId === undefined
-                || expected.lastAssistantTurnId === this.assistantTurnIds.at(-1));
-            if (!matches) return { result: { value: false } };
-            if (!expected.activate) {
-              return { result: { value: true } };
-            }
-            this.sendClicks += 1;
-            if (this.renderedOnSend !== undefined) this.users.push(this.renderedOnSend);
-            this.onSend();
-            return { result: { value: true } };
-          }
           if (method === "Input.dispatchMouseEvent" && type === "mouseReleased") {
             if (params?.x === 140) {
               this.powerMenuVisible = !this.powerMenuVisible;
@@ -1060,10 +1041,7 @@ class FakePage implements BrowserPage {
         filter() { return this; }
       };
     }
-    if (selector === [
-      "form:has(#prompt-textarea)",
-      "button[aria-haspopup='menu']:has([data-animated-slider-trigger='true'])"
-    ].join(" ")) {
+    if (selector === "form:has(#prompt-textarea) button.__composer-pill[aria-haspopup='menu']") {
       return {
         count: async () => this.powerOpenerCount,
         isVisible: async () => true,
@@ -1083,13 +1061,12 @@ class FakePage implements BrowserPage {
           }
         },
         evaluate: async <T>(fn: (element: Element) => T) =>
-          String(fn).includes("hasSliderTrigger")
+          String(fn).includes("aria-expanded") && String(fn).includes("tagName")
             ? ({
                 tagName: "BUTTON",
                 role: null,
                 hasPopup: "menu",
                 expanded: this.powerMenuVisible ? "true" : "false",
-                hasSliderTrigger: true,
                 label: this.powerLabel
               } as T)
             : String(fn).includes("getBoundingClientRect")

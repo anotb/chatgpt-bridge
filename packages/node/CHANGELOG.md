@@ -2,9 +2,13 @@
 
 ## 0.8.2
 
+- Replaces existing composer draft text with the exact requested prompt instead of blocking new submissions.
+- Accepts zero-turn ChatGPT home pages whose composer restores draft text.
+- Replaces the handcrafted atomic composer-envelope predicate with one direct visible Send click followed by rendered-turn reconciliation.
+- Tracks ChatGPT's current structural composer-pill mode control for Power discovery.
 - Fixed exact multiline prompt verification against ChatGPT's contenteditable paragraph structure.
 - Reads zero-pill prompts from the live editor and retains clone-based inline tool-pill stripping.
-- Preserves exact envelope ownership and at-most-one Send activation.
+- Preserves rendered-turn ownership and at-most-one Send activation.
 
 ## 0.8.1
 

@@ -752,7 +752,6 @@ import { constants } from "node:fs";
 import { access, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { basename as basename2, extname, isAbsolute, resolve as resolve2 } from "node:path";
 var COMPOSER_FORM_SELECTOR = "main form:has(#prompt-textarea), form:has(#prompt-textarea)";
-var ATTACHMENT_NAME_SELECTOR = ".truncate.font-semibold";
 var UPLOAD_INPUT_SELECTOR = "#upload-files";
 var ADD_FILES_LABEL = "Add files and more";
 var PROCESSING_TEXT = /\b(uploading|processing|attaching|preparing|reading|scanning|analyzing)\b/i;
@@ -2356,10 +2355,7 @@ function integerAttribute(value) {
 var COMPOSER_SELECTOR = "#prompt-textarea";
 var SEND_SELECTOR = "button[data-testid='send-button']";
 var POWER_CONTROL_SELECTOR2 = "[role='menuitem'][aria-label='Power']";
-var POWER_OPENER_SELECTOR = [
-  "form:has(#prompt-textarea)",
-  "button[aria-haspopup='menu']:has([data-animated-slider-trigger='true'])"
-].join(" ");
+var POWER_OPENER_SELECTOR = "form:has(#prompt-textarea) button.__composer-pill[aria-haspopup='menu']";
 var NEW_PAGE_READY_TIMEOUT_MS = 1e4;
 var ChatGPTBrowserPort = class {
   #env;
@@ -2374,10 +2370,9 @@ var ChatGPTBrowserPort = class {
   #boundTabId;
   #artifactSources = /* @__PURE__ */ new Map();
   #powerTargets;
-  #selectedPower;
   #selectedTools = /* @__PURE__ */ new Set();
   #attachedFileNames = [];
-  #pristinePreflightTabId;
+  #newChatPreflightTabId;
   constructor(env, options = {}) {
     this.#env = env;
     this.#acknowledgementTimeoutMs = positive3(options.acknowledgementTimeoutMs, 5e3);
@@ -2389,11 +2384,11 @@ var ChatGPTBrowserPort = class {
     await validateLocalFiles(paths);
   }
   async bindThread(thread) {
-    const preflightTabId = thread === "new" ? this.#pristinePreflightTabId : void 0;
+    const preflightTabId = thread === "new" ? this.#newChatPreflightTabId : void 0;
     const preflightPowerTargets = preflightTabId === void 0 ? void 0 : this.#powerTargets;
-    this.#pristinePreflightTabId = void 0;
+    this.#newChatPreflightTabId = void 0;
     this.#resetBinding();
-    let acquired = preflightTabId === void 0 ? void 0 : await this.#reclaimPristinePreflight(preflightTabId);
+    let acquired = preflightTabId === void 0 ? void 0 : await this.#reclaimNewChatPreflight(preflightTabId);
     if (acquired !== void 0 && preflightPowerTargets !== void 0) {
       this.#powerTargets = preflightPowerTargets;
     }
@@ -2415,7 +2410,7 @@ var ChatGPTBrowserPort = class {
       if (after.url !== CHATGPT_HOME) {
         throw new Error(`New Chat binding was not verified at ${CHATGPT_HOME}.`);
       }
-      const readiness = await waitForPristineNewPage(
+      const readiness = await waitForNewChatPage(
         page,
         NEW_PAGE_READY_TIMEOUT_MS,
         this.#pollMs
@@ -2444,7 +2439,7 @@ var ChatGPTBrowserPort = class {
   }
   async bindHandle(handle) {
     validateHandle(handle);
-    this.#pristinePreflightTabId = void 0;
+    this.#newChatPreflightTabId = void 0;
     this.#owner = void 0;
     this.#powerTargets = void 0;
     this.#artifactSources.clear();
@@ -2501,27 +2496,22 @@ var ChatGPTBrowserPort = class {
   }
   async inspectTargets() {
     const preflight = this.#boundTabId === void 0 && this.#owner === void 0;
-    const page = preflight ? await this.#pristinePreflightPage() : await this.#page();
+    const page = preflight ? await this.#newChatPreflightPage() : await this.#page();
     try {
       await openPowerMenu(page);
       this.#powerTargets ??= new ChatGPTPowerTargetPort(page);
-      const inspected = await this.#powerTargets.inspectTargets();
-      const openerLabel = await readComposerPowerLabel(page);
-      if (inspected.active.power !== openerLabel) {
-        throw new Error("Visible Power label does not match its active slider mode.");
-      }
-      return inspected;
+      return await this.#powerTargets.inspectTargets();
     } finally {
       try {
         await closePowerMenu(page);
       } finally {
         if (preflight) {
-          const readiness = await waitForPristineNewPage(
+          const readiness = await waitForNewChatPage(
             page,
             NEW_PAGE_READY_TIMEOUT_MS,
             this.#pollMs
           );
-          this.#pristinePreflightTabId = readiness.ready ? exactTabId(page) : void 0;
+          this.#newChatPreflightTabId = readiness.ready ? exactTabId(page) : void 0;
         }
       }
     }
@@ -2538,7 +2528,6 @@ var ChatGPTBrowserPort = class {
     if (await readComposerPowerLabel(page) !== label) {
       throw new Error(`Chat target ${JSON.stringify(label)} lacks an exact composer echo.`);
     }
-    this.#selectedPower = label;
     await this.#assertBoundLocation();
   }
   async selectTool(label) {
@@ -2589,11 +2578,7 @@ var ChatGPTBrowserPort = class {
     if (composer.fill === void 0 || composer.evaluate === void 0) {
       throw new Error("ChatGPT composer lacks exact fill and readback operations.");
     }
-    const existing = await readEditableText(composer);
-    if (existing !== "" && existing !== prompt) {
-      throw new Error("ChatGPT composer contains a different draft; it was not overwritten.");
-    }
-    if (existing !== prompt) await composer.fill(prompt);
+    if (await readEditableText(composer) !== prompt) await composer.fill(prompt);
     if (await readEditableText(composer) !== prompt) {
       throw new Error("ChatGPT composer readback did not exactly match the prompt.");
     }
@@ -2604,16 +2589,6 @@ var ChatGPTBrowserPort = class {
   }
   async submissionPresentationSha256s(prompt) {
     requirePrompt(prompt);
-    const page = await this.#page();
-    const expectedUrl = this.#boundUrl;
-    if (expectedUrl === void 0) throw new Error("Submission requires an exact bound ChatGPT route.");
-    await verifyComposerEnvelope(page, {
-      url: expectedUrl,
-      prompt,
-      attachmentNames: this.#attachedFileNames,
-      toolLabels: [...this.#selectedTools],
-      ...this.#selectedPower === void 0 ? {} : { power: this.#selectedPower }
-    });
     return promptPresentationSha256s(prompt);
   }
   async submitPrompt(input) {
@@ -2629,20 +2604,8 @@ var ChatGPTBrowserPort = class {
     }
     const page = await this.#page();
     await this.#assertBoundLocation();
-    const expectedUrl = this.#boundUrl;
-    if (expectedUrl === void 0) throw new Error("Submission requires an exact bound ChatGPT route.");
     try {
-      await activateSend(page, {
-        url: expectedUrl,
-        prompt: input.prompt,
-        attachmentNames: this.#attachedFileNames,
-        toolLabels: [...this.#selectedTools],
-        ...input.power === void 0 ? {} : { power: input.power },
-        userTurnBefore: input.userTurnBefore,
-        assistantTurnBefore: input.assistantTurnBefore,
-        ...input.lastUserTurnId === void 0 ? {} : { lastUserTurnId: input.lastUserTurnId },
-        ...input.lastAssistantTurnId === void 0 ? {} : { lastAssistantTurnId: input.lastAssistantTurnId }
-      });
+      await activateSend(page);
     } catch {
     }
     const deadline = Date.now() + this.#acknowledgementTimeoutMs;
@@ -2773,16 +2736,15 @@ var ChatGPTBrowserPort = class {
     await exactChatLocation(this.#env.page);
     return this.#env.page;
   }
-  async #freshPristinePreflight() {
-    this.#pristinePreflightTabId = void 0;
+  async #freshNewChatPreflight() {
+    this.#newChatPreflightTabId = void 0;
     this.#powerTargets = void 0;
-    this.#selectedPower = void 0;
     const acquired = await acquireChatGPTPage(this.#env, {
       createIfMissing: true,
       fresh: true
     });
     this.#acquired = true;
-    const readiness = await waitForPristineNewPage(
+    const readiness = await waitForNewChatPage(
       acquired.page,
       NEW_PAGE_READY_TIMEOUT_MS,
       this.#pollMs
@@ -2790,26 +2752,26 @@ var ChatGPTBrowserPort = class {
     if (!readiness.ready) {
       throw new Error(`Target inspection page is not ready: ${readiness.reason}`);
     }
-    this.#pristinePreflightTabId = exactTabId(acquired.page);
+    this.#newChatPreflightTabId = exactTabId(acquired.page);
     return acquired.page;
   }
-  async #pristinePreflightPage() {
-    if (this.#pristinePreflightTabId !== void 0) {
-      const reclaimed = await this.#reclaimPristinePreflight(this.#pristinePreflightTabId);
+  async #newChatPreflightPage() {
+    if (this.#newChatPreflightTabId !== void 0) {
+      const reclaimed = await this.#reclaimNewChatPreflight(this.#newChatPreflightTabId);
       if (reclaimed !== void 0) return reclaimed.page;
       if (this.#env.browser === void 0) {
         throw new Error("The inspected ChatGPT tab is no longer a zero-turn home page and no fresh tab can be created.");
       }
     }
-    return this.#freshPristinePreflight();
+    return this.#freshNewChatPreflight();
   }
-  async #reclaimPristinePreflight(tabId) {
+  async #reclaimNewChatPreflight(tabId) {
     try {
       const acquired = await acquireChatGPTPage(this.#env, {
         createIfMissing: false,
         expectedTabId: tabId
       });
-      const readiness = await waitForPristineNewPage(
+      const readiness = await waitForNewChatPage(
         acquired.page,
         NEW_PAGE_READY_TIMEOUT_MS,
         this.#pollMs
@@ -3104,7 +3066,7 @@ function validateConversationId(value) {
     throw new Error("Conversation ID contains unsupported characters.");
   }
 }
-async function waitForPristineNewPage(page, timeoutMs, pollMs) {
+async function waitForNewChatPage(page, timeoutMs, pollMs) {
   const deadline = Date.now() + timeoutMs;
   let state = await readNewPageReadiness(page);
   while (!state.ready && state.retry && Date.now() < deadline) {
@@ -3177,9 +3139,6 @@ async function readNewPageReadiness(page) {
     }
     if (await composer.count() !== 1 || composer.isVisible !== void 0 && !await composer.isVisible()) {
       return { ready: false, retry: true, reason: "one visible composer is not ready" };
-    }
-    if (await readEditableText(composer) !== "") {
-      return { ready: false, retry: false, reason: "composer contains a draft" };
     }
     return { ready: true };
   } catch (error) {
@@ -3297,161 +3256,10 @@ async function activateExactPointerControl(page, control, label) {
   if (control.click === void 0) throw new Error(`${label} is not clickable.`);
   await control.click();
 }
-async function activateSend(page, expected) {
-  await evaluateComposerEnvelope(page, { ...expected, activate: true });
-}
-async function verifyComposerEnvelope(page, expected) {
-  await evaluateComposerEnvelope(page, { ...expected, activate: false });
-}
-async function evaluateComposerEnvelope(page, expected) {
-  const rawCdp = await page.capabilities?.get?.("cdp");
-  const cdp = rawCdp;
-  if (cdp?.send === void 0) {
-    throw new Error("Exact ChatGPT composer ownership requires the bound tab's CDP capability.");
-  }
-  const result = await cdp.send("Runtime.evaluate", {
-    expression: composerEnvelopeExpression(expected),
-    userGesture: true,
-    awaitPromise: true,
-    returnByValue: true
-  }, { timeoutMs: 1e4 });
-  if (!cdpBooleanResult(result)) {
-    throw new Error(expected.activate ? "ChatGPT Send activation lacked its exact atomic postcondition." : "ChatGPT composer envelope did not match the exact request.");
-  }
-}
-function composerEnvelopeExpression(expected) {
-  return `(() => {
-  const expected = ${JSON.stringify(expected)};
-  const readExactComposerPrompt = ${readExactComposerPrompt.toString()};
-  if (location.origin !== ${JSON.stringify(CHATGPT_ORIGIN)} || location.href !== expected.url) {
-    throw new Error("Controlled ChatGPT route changed before Send.");
-  }
-  const visible = element => {
-    if (element.closest("[hidden], [aria-hidden='true']") !== null) return false;
-    const style = getComputedStyle(element);
-    return style.display !== "none"
-      && style.visibility !== "hidden"
-      && style.opacity !== "0"
-      && element.getClientRects().length > 0;
-  };
-  const normalizedLabel = element => {
-    const value = element.getAttribute("aria-label")
-      || element.innerText
-      || element.textContent
-      || "";
-    return value.replace(/\\s+/g, " ").trim();
-  };
-  const sameOrdered = (left, right) => {
-    if (left.length !== right.length) return false;
-    return left.every((value, index) => value === right[index]);
-  };
-  const sameMultiset = (left, right) => {
-    if (left.length !== right.length) return false;
-    const orderedLeft = [...left].sort();
-    const orderedRight = [...right].sort();
-    return orderedLeft.every((value, index) => value === orderedRight[index]);
-  };
-
-  const composers = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_FORM_SELECTOR)}))
-    .filter(visible);
-  if (composers.length !== 1) throw new Error("Chat composer is not unique.");
-  const form = composers[0];
-  const editors = Array.from(form.querySelectorAll(${JSON.stringify(COMPOSER_SELECTOR)})).filter(visible);
-  if (editors.length !== 1) throw new Error("Chat prompt editor is not unique.");
-  const editor = editors[0];
-  const prompt = readExactComposerPrompt(editor);
-  if (prompt !== expected.prompt) throw new Error("Exact prompt changed before Send.");
-
-  const attachmentCards = Array.from(form.querySelectorAll(${JSON.stringify(ATTACHMENT_NAME_SELECTOR)}));
-  const attachmentNames = attachmentCards
-    .map(element => (element.textContent || "").trim())
-    .filter(Boolean);
-  const attachmentPending = attachmentCards.some(name => {
-    const container = name.parentElement && name.parentElement.parentElement;
-    const spinner = container && container.querySelector("svg[class*='animate-spin']");
-    const bounds = spinner && spinner.getBoundingClientRect();
-    return bounds && bounds.width > 0 && bounds.height > 0;
-  });
-  if (attachmentPending || !sameOrdered(attachmentNames, expected.attachmentNames)) {
-    throw new Error("Exact ready attachment set changed before Send.");
-  }
-
-  const buttons = Array.from(form.querySelectorAll("button")).filter(visible);
-  const activeToolSelector = [
-    "button[aria-pressed='true']",
-    "button[data-state='active']",
-    "button[data-state='on']",
-    "button[data-selected='true']",
-    "button[data-testid*='tool' i]",
-    "button[data-testid*='composer-chip' i]",
-    "button[data-testid*='composer-pill' i]"
-  ].join(",");
-  const activeToolControls = Array.from(form.querySelectorAll(activeToolSelector))
-    .filter(visible)
-    .filter(button => button.getAttribute("aria-haspopup") !== "menu")
-    .filter(button => !button.matches(${JSON.stringify(SEND_SELECTOR)}))
-    .filter(button => button.id !== "composer-plus-btn")
-    .map(normalizedLabel)
-    .filter(Boolean);
-  const inlineToolLabels = Array.from(editor.querySelectorAll(
-    "[data-inline-selection-pill][data-keyword]"
-  )).map(pill => pill.getAttribute("data-keyword") || "").filter(Boolean);
-  const activeToolLabels = [...new Set([...activeToolControls, ...inlineToolLabels])];
-  if (!sameMultiset(activeToolLabels, expected.toolLabels)) {
-    throw new Error("Exact enumerable active tool set changed before Send.");
-  }
-
-  if (expected.power !== undefined) {
-    const powers = Array.from(form.querySelectorAll(${JSON.stringify(POWER_OPENER_SELECTOR)}))
-      .filter(visible);
-    const power = powers.length === 1
-      ? (powers[0].innerText || powers[0].textContent || "").replace(/\\s+/g, " ").trim()
-      : undefined;
-    if (power !== expected.power) {
-      throw new Error("Requested Power echo changed before Send.");
-    }
-  }
-
-  if (expected.userTurnBefore !== undefined || expected.assistantTurnBefore !== undefined) {
-    const mains = Array.from(document.querySelectorAll("main")).filter(visible);
-    if (mains.length !== 1) throw new Error("Visible Chat main is not unique.");
-    const users = Array.from(mains[0].querySelectorAll('[data-message-author-role="user"]')).filter(visible);
-    const assistants = Array.from(mains[0].querySelectorAll('[data-message-author-role="assistant"]')).filter(visible);
-    if (users.length !== expected.userTurnBefore
-      || assistants.length !== expected.assistantTurnBefore) {
-      throw new Error("Visible turn baselines changed before Send.");
-    }
-    const turnId = message => {
-      const container = message.closest('[data-testid^="conversation-turn-"]')
-        || message.closest("article")
-        || message.closest("[data-message-id]")
-        || message.parentElement
-        || message;
-      return message.getAttribute("data-message-id")
-        || container.getAttribute("data-message-id")
-        || null;
-    };
-    if (expected.lastUserTurnId !== undefined
-      && turnId(users[users.length - 1]) !== expected.lastUserTurnId) {
-      throw new Error("Visible user-turn tail changed before Send.");
-    }
-    if (expected.lastAssistantTurnId !== undefined
-      && turnId(assistants[assistants.length - 1]) !== expected.lastAssistantTurnId) {
-      throw new Error("Visible assistant-turn tail changed before Send.");
-    }
-  }
-
-  if (!expected.activate) return true;
-
-  const sends = Array.from(form.querySelectorAll(${JSON.stringify(SEND_SELECTOR)})).filter(visible);
-  if (sends.length !== 1) throw new Error("ChatGPT Send control is not unique.");
-  const send = sends[0];
-  if (send.disabled || send.getAttribute("aria-disabled") === "true" || send.getAttribute("aria-busy") === "true") {
-    throw new Error("ChatGPT Send control is not ready.");
-  }
-  form.requestSubmit(send);
-  return true;
-})()`;
+async function activateSend(page) {
+  const send = await uniqueVisible2(page, SEND_SELECTOR, "ChatGPT Send control");
+  if (send.click === void 0) throw new Error("ChatGPT Send control is not clickable.");
+  await send.click();
 }
 function readExactComposerPrompt(editor) {
   const tag = editor.tagName.toLowerCase();
@@ -3495,11 +3303,6 @@ function readExactComposerPrompt(editor) {
   promptEditor.querySelectorAll("[data-inline-selection-pill-cursor-target]").forEach((cursor) => cursor.remove());
   return readContentEditableText(promptEditor);
 }
-function cdpBooleanResult(value) {
-  if (typeof value !== "object" || value === null || !("result" in value)) return false;
-  const result = value.result;
-  return typeof result === "object" && result !== null && "value" in result && result.value === true;
-}
 async function bringPageToFront(cdp) {
   try {
     await cdp.send("Page.bringToFront", {}, { timeoutMs: 1e4 });
@@ -3515,11 +3318,10 @@ async function readPowerOpenerState(opener) {
     role: element.getAttribute("role"),
     hasPopup: element.getAttribute("aria-haspopup"),
     expanded: element.getAttribute("aria-expanded"),
-    hasSliderTrigger: element.querySelector("[data-animated-slider-trigger='true']") !== null,
     label: (element.innerText ?? element.textContent ?? "").replace(/\s+/g, " ").trim()
   }));
-  if (state.tagName !== "BUTTON" || state.role !== null && state.role !== "button" || state.hasPopup !== "menu" || state.expanded !== "true" && state.expanded !== "false" || !state.hasSliderTrigger || state.label.length === 0) {
-    throw new Error("ChatGPT Power opener does not expose an exact button state and mode label.");
+  if (state.tagName !== "BUTTON" || state.role !== null && state.role !== "button" || state.hasPopup !== "menu" || state.expanded !== "true" && state.expanded !== "false" || state.label.length === 0) {
+    throw new Error("ChatGPT Power opener does not expose a button state and label.");
   }
   return {
     expanded: state.expanded === "true",

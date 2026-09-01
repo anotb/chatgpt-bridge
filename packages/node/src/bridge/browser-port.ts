@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 
 import {
-  ATTACHMENT_NAME_SELECTOR,
   COMPOSER_FORM_SELECTOR,
   attachFiles as attachVisibleFiles,
   selectTool as selectVisibleTool,
@@ -50,10 +49,8 @@ import type {
 const COMPOSER_SELECTOR = "#prompt-textarea";
 const SEND_SELECTOR = "button[data-testid='send-button']";
 const POWER_CONTROL_SELECTOR = "[role='menuitem'][aria-label='Power']";
-const POWER_OPENER_SELECTOR = [
-  "form:has(#prompt-textarea)",
-  "button[aria-haspopup='menu']:has([data-animated-slider-trigger='true'])"
-].join(" ");
+const POWER_OPENER_SELECTOR =
+  "form:has(#prompt-textarea) button.__composer-pill[aria-haspopup='menu']";
 const NEW_PAGE_READY_TIMEOUT_MS = 10_000;
 
 type BrowserCdpCapability = {
@@ -92,10 +89,9 @@ export class ChatGPTBrowserPort implements BridgePort {
   #boundTabId: string | undefined;
   #artifactSources = new Map<string, HandleArtifact>();
   #powerTargets: ChatGPTPowerTargetPort | undefined;
-  #selectedPower: string | undefined;
   #selectedTools = new Set<string>();
   #attachedFileNames: string[] = [];
-  #pristinePreflightTabId: string | undefined;
+  #newChatPreflightTabId: string | undefined;
 
   constructor(env: BrowserEnv, options: BrowserBridgePortOptions = {}) {
     this.#env = env;
@@ -110,13 +106,13 @@ export class ChatGPTBrowserPort implements BridgePort {
   }
 
   async bindThread(thread: BridgeThread): Promise<BridgeBinding> {
-    const preflightTabId = thread === "new" ? this.#pristinePreflightTabId : undefined;
+    const preflightTabId = thread === "new" ? this.#newChatPreflightTabId : undefined;
     const preflightPowerTargets = preflightTabId === undefined ? undefined : this.#powerTargets;
-    this.#pristinePreflightTabId = undefined;
+    this.#newChatPreflightTabId = undefined;
     this.#resetBinding();
     let acquired = preflightTabId === undefined
       ? undefined
-      : await this.#reclaimPristinePreflight(preflightTabId);
+      : await this.#reclaimNewChatPreflight(preflightTabId);
     if (acquired !== undefined && preflightPowerTargets !== undefined) {
       this.#powerTargets = preflightPowerTargets;
     }
@@ -139,7 +135,7 @@ export class ChatGPTBrowserPort implements BridgePort {
       if (after.url !== CHATGPT_HOME) {
         throw new Error(`New Chat binding was not verified at ${CHATGPT_HOME}.`);
       }
-      const readiness = await waitForPristineNewPage(
+      const readiness = await waitForNewChatPage(
         page,
         NEW_PAGE_READY_TIMEOUT_MS,
         this.#pollMs
@@ -170,7 +166,7 @@ export class ChatGPTBrowserPort implements BridgePort {
 
   async bindHandle(handle: BridgeHandle): Promise<BridgeBinding> {
     validateHandle(handle);
-    this.#pristinePreflightTabId = undefined;
+    this.#newChatPreflightTabId = undefined;
     this.#owner = undefined;
     this.#powerTargets = undefined;
     this.#artifactSources.clear();
@@ -233,27 +229,22 @@ export class ChatGPTBrowserPort implements BridgePort {
 
   async inspectTargets(): Promise<BridgeTargetSnapshot> {
     const preflight = this.#boundTabId === undefined && this.#owner === undefined;
-    const page = preflight ? await this.#pristinePreflightPage() : await this.#page();
+    const page = preflight ? await this.#newChatPreflightPage() : await this.#page();
     try {
       await openPowerMenu(page);
       this.#powerTargets ??= new ChatGPTPowerTargetPort(page);
-      const inspected = await this.#powerTargets.inspectTargets();
-      const openerLabel = await readComposerPowerLabel(page);
-      if (inspected.active.power !== openerLabel) {
-        throw new Error("Visible Power label does not match its active slider mode.");
-      }
-      return inspected;
+      return await this.#powerTargets.inspectTargets();
     } finally {
       try {
         await closePowerMenu(page);
       } finally {
         if (preflight) {
-          const readiness = await waitForPristineNewPage(
+          const readiness = await waitForNewChatPage(
             page,
             NEW_PAGE_READY_TIMEOUT_MS,
             this.#pollMs
           );
-          this.#pristinePreflightTabId = readiness.ready ? exactTabId(page) : undefined;
+          this.#newChatPreflightTabId = readiness.ready ? exactTabId(page) : undefined;
         }
       }
     }
@@ -271,7 +262,6 @@ export class ChatGPTBrowserPort implements BridgePort {
     if (await readComposerPowerLabel(page) !== label) {
       throw new Error(`Chat target ${JSON.stringify(label)} lacks an exact composer echo.`);
     }
-    this.#selectedPower = label;
     await this.#assertBoundLocation();
   }
 
@@ -329,11 +319,7 @@ export class ChatGPTBrowserPort implements BridgePort {
     if (composer.fill === undefined || composer.evaluate === undefined) {
       throw new Error("ChatGPT composer lacks exact fill and readback operations.");
     }
-    const existing = await readEditableText(composer);
-    if (existing !== "" && existing !== prompt) {
-      throw new Error("ChatGPT composer contains a different draft; it was not overwritten.");
-    }
-    if (existing !== prompt) await composer.fill(prompt);
+    if (await readEditableText(composer) !== prompt) await composer.fill(prompt);
     if (await readEditableText(composer) !== prompt) {
       throw new Error("ChatGPT composer readback did not exactly match the prompt.");
     }
@@ -345,16 +331,6 @@ export class ChatGPTBrowserPort implements BridgePort {
 
   async submissionPresentationSha256s(prompt: string): Promise<readonly string[]> {
     requirePrompt(prompt);
-    const page = await this.#page();
-    const expectedUrl = this.#boundUrl;
-    if (expectedUrl === undefined) throw new Error("Submission requires an exact bound ChatGPT route.");
-    await verifyComposerEnvelope(page, {
-      url: expectedUrl,
-      prompt,
-      attachmentNames: this.#attachedFileNames,
-      toolLabels: [...this.#selectedTools],
-      ...(this.#selectedPower === undefined ? {} : { power: this.#selectedPower })
-    });
     return promptPresentationSha256s(prompt);
   }
 
@@ -380,24 +356,9 @@ export class ChatGPTBrowserPort implements BridgePort {
 
     const page = await this.#page();
     await this.#assertBoundLocation();
-    const expectedUrl = this.#boundUrl;
-    if (expectedUrl === undefined) throw new Error("Submission requires an exact bound ChatGPT route.");
-
     // One irreversible action. Errors are reconciled by reads; never by another activation.
     try {
-      await activateSend(page, {
-        url: expectedUrl,
-        prompt: input.prompt,
-        attachmentNames: this.#attachedFileNames,
-        toolLabels: [...this.#selectedTools],
-        ...(input.power === undefined ? {} : { power: input.power }),
-        userTurnBefore: input.userTurnBefore,
-        assistantTurnBefore: input.assistantTurnBefore,
-        ...(input.lastUserTurnId === undefined ? {} : { lastUserTurnId: input.lastUserTurnId }),
-        ...(input.lastAssistantTurnId === undefined
-          ? {}
-          : { lastAssistantTurnId: input.lastAssistantTurnId })
-      });
+      await activateSend(page);
     } catch {
       // The browser can deliver the click and then report a transport error.
     }
@@ -554,16 +515,15 @@ export class ChatGPTBrowserPort implements BridgePort {
     return this.#env.page;
   }
 
-  async #freshPristinePreflight(): Promise<BrowserPage> {
-    this.#pristinePreflightTabId = undefined;
+  async #freshNewChatPreflight(): Promise<BrowserPage> {
+    this.#newChatPreflightTabId = undefined;
     this.#powerTargets = undefined;
-    this.#selectedPower = undefined;
     const acquired = await acquireChatGPTPage(this.#env, {
       createIfMissing: true,
       fresh: true
     });
     this.#acquired = true;
-    const readiness = await waitForPristineNewPage(
+    const readiness = await waitForNewChatPage(
       acquired.page,
       NEW_PAGE_READY_TIMEOUT_MS,
       this.#pollMs
@@ -571,22 +531,22 @@ export class ChatGPTBrowserPort implements BridgePort {
     if (!readiness.ready) {
       throw new Error(`Target inspection page is not ready: ${readiness.reason}`);
     }
-    this.#pristinePreflightTabId = exactTabId(acquired.page);
+    this.#newChatPreflightTabId = exactTabId(acquired.page);
     return acquired.page;
   }
 
-  async #pristinePreflightPage(): Promise<BrowserPage> {
-    if (this.#pristinePreflightTabId !== undefined) {
-      const reclaimed = await this.#reclaimPristinePreflight(this.#pristinePreflightTabId);
+  async #newChatPreflightPage(): Promise<BrowserPage> {
+    if (this.#newChatPreflightTabId !== undefined) {
+      const reclaimed = await this.#reclaimNewChatPreflight(this.#newChatPreflightTabId);
       if (reclaimed !== undefined) return reclaimed.page;
       if (this.#env.browser === undefined) {
         throw new Error("The inspected ChatGPT tab is no longer a zero-turn home page and no fresh tab can be created.");
       }
     }
-    return this.#freshPristinePreflight();
+    return this.#freshNewChatPreflight();
   }
 
-  async #reclaimPristinePreflight(
+  async #reclaimNewChatPreflight(
     tabId: string
   ): Promise<Awaited<ReturnType<typeof acquireChatGPTPage>> | undefined> {
     try {
@@ -594,7 +554,7 @@ export class ChatGPTBrowserPort implements BridgePort {
         createIfMissing: false,
         expectedTabId: tabId
       });
-      const readiness = await waitForPristineNewPage(
+      const readiness = await waitForNewChatPage(
         acquired.page,
         NEW_PAGE_READY_TIMEOUT_MS,
         this.#pollMs
@@ -1006,7 +966,7 @@ type NewPageReadiness =
   | { ready: false; retry: boolean; reason: string };
 type NewPageWaitResult = { ready: true } | { ready: false; reason: string };
 
-async function waitForPristineNewPage(
+async function waitForNewChatPage(
   page: BrowserPage,
   timeoutMs: number,
   pollMs: number
@@ -1105,9 +1065,6 @@ async function readNewPageReadiness(page: BrowserPage): Promise<NewPageReadiness
     if (await composer.count() !== 1
       || (composer.isVisible !== undefined && !await composer.isVisible())) {
       return { ready: false, retry: true, reason: "one visible composer is not ready" };
-    }
-    if (await readEditableText(composer) !== "") {
-      return { ready: false, retry: false, reason: "composer contains a draft" };
     }
     return { ready: true };
   } catch (error) {
@@ -1249,201 +1206,10 @@ async function activateExactPointerControl(
   await control.click();
 }
 
-type ComposerEnvelopeExpectation = {
-  url: string;
-  prompt: string;
-  attachmentNames: readonly string[];
-  toolLabels: readonly string[];
-  power?: string;
-};
-
-type AtomicSendExpectation = ComposerEnvelopeExpectation & {
-  userTurnBefore: number;
-  assistantTurnBefore: number;
-  lastUserTurnId?: string;
-  lastAssistantTurnId?: string;
-};
-
-async function activateSend(page: BrowserPage, expected: AtomicSendExpectation): Promise<void> {
-  await evaluateComposerEnvelope(page, { ...expected, activate: true });
-}
-
-async function verifyComposerEnvelope(
-  page: BrowserPage,
-  expected: ComposerEnvelopeExpectation
-): Promise<void> {
-  await evaluateComposerEnvelope(page, { ...expected, activate: false });
-}
-
-async function evaluateComposerEnvelope(
-  page: BrowserPage,
-  expected: ComposerEnvelopeExpectation & {
-    activate: boolean;
-    userTurnBefore?: number;
-    assistantTurnBefore?: number;
-    lastUserTurnId?: string;
-    lastAssistantTurnId?: string;
-  }
-): Promise<void> {
-  const rawCdp = await page.capabilities?.get?.("cdp");
-  const cdp = rawCdp as BrowserCdpCapability | undefined;
-  if (cdp?.send === undefined) {
-    throw new Error("Exact ChatGPT composer ownership requires the bound tab's CDP capability.");
-  }
-  const result = await cdp.send("Runtime.evaluate", {
-    expression: composerEnvelopeExpression(expected),
-    userGesture: true,
-    awaitPromise: true,
-    returnByValue: true
-  }, { timeoutMs: 10_000 });
-  if (!cdpBooleanResult(result)) {
-    throw new Error(expected.activate
-      ? "ChatGPT Send activation lacked its exact atomic postcondition."
-      : "ChatGPT composer envelope did not match the exact request.");
-  }
-}
-
-function composerEnvelopeExpression(
-  expected: ComposerEnvelopeExpectation & {
-    activate: boolean;
-    userTurnBefore?: number;
-    assistantTurnBefore?: number;
-    lastUserTurnId?: string;
-    lastAssistantTurnId?: string;
-  }
-): string {
-  return `(() => {
-  const expected = ${JSON.stringify(expected)};
-  const readExactComposerPrompt = ${readExactComposerPrompt.toString()};
-  if (location.origin !== ${JSON.stringify(CHATGPT_ORIGIN)} || location.href !== expected.url) {
-    throw new Error("Controlled ChatGPT route changed before Send.");
-  }
-  const visible = element => {
-    if (element.closest("[hidden], [aria-hidden='true']") !== null) return false;
-    const style = getComputedStyle(element);
-    return style.display !== "none"
-      && style.visibility !== "hidden"
-      && style.opacity !== "0"
-      && element.getClientRects().length > 0;
-  };
-  const normalizedLabel = element => {
-    const value = element.getAttribute("aria-label")
-      || element.innerText
-      || element.textContent
-      || "";
-    return value.replace(/\\s+/g, " ").trim();
-  };
-  const sameOrdered = (left, right) => {
-    if (left.length !== right.length) return false;
-    return left.every((value, index) => value === right[index]);
-  };
-  const sameMultiset = (left, right) => {
-    if (left.length !== right.length) return false;
-    const orderedLeft = [...left].sort();
-    const orderedRight = [...right].sort();
-    return orderedLeft.every((value, index) => value === orderedRight[index]);
-  };
-
-  const composers = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_FORM_SELECTOR)}))
-    .filter(visible);
-  if (composers.length !== 1) throw new Error("Chat composer is not unique.");
-  const form = composers[0];
-  const editors = Array.from(form.querySelectorAll(${JSON.stringify(COMPOSER_SELECTOR)})).filter(visible);
-  if (editors.length !== 1) throw new Error("Chat prompt editor is not unique.");
-  const editor = editors[0];
-  const prompt = readExactComposerPrompt(editor);
-  if (prompt !== expected.prompt) throw new Error("Exact prompt changed before Send.");
-
-  const attachmentCards = Array.from(form.querySelectorAll(${JSON.stringify(ATTACHMENT_NAME_SELECTOR)}));
-  const attachmentNames = attachmentCards
-    .map(element => (element.textContent || "").trim())
-    .filter(Boolean);
-  const attachmentPending = attachmentCards.some(name => {
-    const container = name.parentElement && name.parentElement.parentElement;
-    const spinner = container && container.querySelector("svg[class*='animate-spin']");
-    const bounds = spinner && spinner.getBoundingClientRect();
-    return bounds && bounds.width > 0 && bounds.height > 0;
-  });
-  if (attachmentPending || !sameOrdered(attachmentNames, expected.attachmentNames)) {
-    throw new Error("Exact ready attachment set changed before Send.");
-  }
-
-  const buttons = Array.from(form.querySelectorAll("button")).filter(visible);
-  const activeToolSelector = [
-    "button[aria-pressed='true']",
-    "button[data-state='active']",
-    "button[data-state='on']",
-    "button[data-selected='true']",
-    "button[data-testid*='tool' i]",
-    "button[data-testid*='composer-chip' i]",
-    "button[data-testid*='composer-pill' i]"
-  ].join(",");
-  const activeToolControls = Array.from(form.querySelectorAll(activeToolSelector))
-    .filter(visible)
-    .filter(button => button.getAttribute("aria-haspopup") !== "menu")
-    .filter(button => !button.matches(${JSON.stringify(SEND_SELECTOR)}))
-    .filter(button => button.id !== "composer-plus-btn")
-    .map(normalizedLabel)
-    .filter(Boolean);
-  const inlineToolLabels = Array.from(editor.querySelectorAll(
-    "[data-inline-selection-pill][data-keyword]"
-  )).map(pill => pill.getAttribute("data-keyword") || "").filter(Boolean);
-  const activeToolLabels = [...new Set([...activeToolControls, ...inlineToolLabels])];
-  if (!sameMultiset(activeToolLabels, expected.toolLabels)) {
-    throw new Error("Exact enumerable active tool set changed before Send.");
-  }
-
-  if (expected.power !== undefined) {
-    const powers = Array.from(form.querySelectorAll(${JSON.stringify(POWER_OPENER_SELECTOR)}))
-      .filter(visible);
-    const power = powers.length === 1
-      ? (powers[0].innerText || powers[0].textContent || "").replace(/\\s+/g, " ").trim()
-      : undefined;
-    if (power !== expected.power) {
-      throw new Error("Requested Power echo changed before Send.");
-    }
-  }
-
-  if (expected.userTurnBefore !== undefined || expected.assistantTurnBefore !== undefined) {
-    const mains = Array.from(document.querySelectorAll("main")).filter(visible);
-    if (mains.length !== 1) throw new Error("Visible Chat main is not unique.");
-    const users = Array.from(mains[0].querySelectorAll('[data-message-author-role="user"]')).filter(visible);
-    const assistants = Array.from(mains[0].querySelectorAll('[data-message-author-role="assistant"]')).filter(visible);
-    if (users.length !== expected.userTurnBefore
-      || assistants.length !== expected.assistantTurnBefore) {
-      throw new Error("Visible turn baselines changed before Send.");
-    }
-    const turnId = message => {
-      const container = message.closest('[data-testid^="conversation-turn-"]')
-        || message.closest("article")
-        || message.closest("[data-message-id]")
-        || message.parentElement
-        || message;
-      return message.getAttribute("data-message-id")
-        || container.getAttribute("data-message-id")
-        || null;
-    };
-    if (expected.lastUserTurnId !== undefined
-      && turnId(users[users.length - 1]) !== expected.lastUserTurnId) {
-      throw new Error("Visible user-turn tail changed before Send.");
-    }
-    if (expected.lastAssistantTurnId !== undefined
-      && turnId(assistants[assistants.length - 1]) !== expected.lastAssistantTurnId) {
-      throw new Error("Visible assistant-turn tail changed before Send.");
-    }
-  }
-
-  if (!expected.activate) return true;
-
-  const sends = Array.from(form.querySelectorAll(${JSON.stringify(SEND_SELECTOR)})).filter(visible);
-  if (sends.length !== 1) throw new Error("ChatGPT Send control is not unique.");
-  const send = sends[0];
-  if (send.disabled || send.getAttribute("aria-disabled") === "true" || send.getAttribute("aria-busy") === "true") {
-    throw new Error("ChatGPT Send control is not ready.");
-  }
-  form.requestSubmit(send);
-  return true;
-})()`;
+async function activateSend(page: BrowserPage): Promise<void> {
+  const send = await uniqueVisible(page, SEND_SELECTOR, "ChatGPT Send control");
+  if (send.click === undefined) throw new Error("ChatGPT Send control is not clickable.");
+  await send.click();
 }
 
 /** Internal browser-side prompt reader, exported only for direct adapter tests. */
@@ -1496,15 +1262,6 @@ export function readExactComposerPrompt(editor: Element): string {
   return readContentEditableText(promptEditor);
 }
 
-function cdpBooleanResult(value: unknown): boolean {
-  if (typeof value !== "object" || value === null || !("result" in value)) return false;
-  const result = value.result;
-  return typeof result === "object"
-    && result !== null
-    && "value" in result
-    && result.value === true;
-}
-
 async function bringPageToFront(cdp: BrowserCdpCapability): Promise<void> {
   try {
     await cdp.send!("Page.bringToFront", {}, { timeoutMs: 10_000 });
@@ -1528,7 +1285,6 @@ async function readPowerOpenerState(opener: BrowserLocator): Promise<PowerOpener
     role: element.getAttribute("role"),
     hasPopup: element.getAttribute("aria-haspopup"),
     expanded: element.getAttribute("aria-expanded"),
-    hasSliderTrigger: element.querySelector("[data-animated-slider-trigger='true']") !== null,
     label: ((element as HTMLElement).innerText ?? element.textContent ?? "")
       .replace(/\s+/g, " ")
       .trim()
@@ -1537,9 +1293,8 @@ async function readPowerOpenerState(opener: BrowserLocator): Promise<PowerOpener
     || (state.role !== null && state.role !== "button")
     || state.hasPopup !== "menu"
     || (state.expanded !== "true" && state.expanded !== "false")
-    || !state.hasSliderTrigger
     || state.label.length === 0) {
-    throw new Error("ChatGPT Power opener does not expose an exact button state and mode label.");
+    throw new Error("ChatGPT Power opener does not expose a button state and label.");
   }
   return {
     expanded: state.expanded === "true",
