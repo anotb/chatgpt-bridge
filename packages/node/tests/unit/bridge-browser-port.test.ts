@@ -550,6 +550,7 @@ describe("ChatGPTBrowserPort", () => {
     })).resolves.toMatchObject({ confirmed: true, conversationId: "thread-cdp-send" });
 
     expect(page.sendClicks).toBe(1);
+    expect(page.sendClickOptions).toEqual([{ timeoutMs: 60_000 }]);
     expect(page.sendKeyPresses).toBe(0);
     expect(page.cdpCommands).toEqual([]);
   });
@@ -951,6 +952,7 @@ class FakePage implements BrowserPage {
   responseActions = false;
   generating = false;
   sendClicks = 0;
+  sendClickOptions: unknown[] = [];
   sendKeyPresses = 0;
   copyClicks = 0;
   powerMenuVisible = false;
@@ -1159,7 +1161,8 @@ class FakePage implements BrowserPage {
         String(fn).includes("getBoundingClientRect")
           ? ({ x: 300, y: 100, width: 80, height: 36 } as T)
           : ({ disabled: false, busy: false } as T),
-      click: async () => {
+      click: async options => {
+        this.sendClickOptions.push(options);
         this.sendClicks += 1;
         if (this.renderedOnSend !== undefined) this.users.push(this.renderedOnSend);
         this.onSend();

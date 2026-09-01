@@ -52,6 +52,7 @@ const POWER_CONTROL_SELECTOR = "[role='menuitem'][aria-label='Power']";
 const POWER_OPENER_SELECTOR =
   "form:has(#prompt-textarea) button.__composer-pill[aria-haspopup='menu']";
 const NEW_PAGE_READY_TIMEOUT_MS = 10_000;
+const SEND_ACTION_TIMEOUT_MS = 60_000;
 
 type BrowserCdpCapability = {
   send?: (
@@ -95,7 +96,7 @@ export class ChatGPTBrowserPort implements BridgePort {
 
   constructor(env: BrowserEnv, options: BrowserBridgePortOptions = {}) {
     this.#env = env;
-    this.#acknowledgementTimeoutMs = positive(options.acknowledgementTimeoutMs, 5_000);
+    this.#acknowledgementTimeoutMs = positive(options.acknowledgementTimeoutMs, 20_000);
     this.#attachmentTimeoutMs = positive(options.attachmentTimeoutMs, 30_000);
     this.#artifactTimeoutMs = positive(options.artifactTimeoutMs, 120_000);
     this.#pollMs = positive(options.pollMs, 100);
@@ -1209,7 +1210,9 @@ async function activateExactPointerControl(
 async function activateSend(page: BrowserPage): Promise<void> {
   const send = await uniqueVisible(page, SEND_SELECTOR, "ChatGPT Send control");
   if (send.click === undefined) throw new Error("ChatGPT Send control is not clickable.");
-  await send.click();
+  // Let the browser wait for ordinary UI actionability (notably attachment
+  // processing) before performing the one allowed activation.
+  await send.click({ timeoutMs: SEND_ACTION_TIMEOUT_MS });
 }
 
 /** Internal browser-side prompt reader, exported only for direct adapter tests. */

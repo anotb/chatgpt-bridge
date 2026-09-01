@@ -2,7 +2,7 @@ export const CHATGPT_ORIGIN = "https://chatgpt.com";
 export const CHATGPT_HOME = `${CHATGPT_ORIGIN}/`;
 
 export type BrowserLocator = {
-  click?: (options?: unknown) => Promise<void>;
+  click?: (options?: { timeoutMs?: number }) => Promise<void>;
   press?: (key: string, options?: unknown) => Promise<void>;
   fill?: (value: string, options?: unknown) => Promise<void>;
   count?: () => Promise<number>;

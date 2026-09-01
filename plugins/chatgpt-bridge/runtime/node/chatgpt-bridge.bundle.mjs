@@ -2357,6 +2357,7 @@ var SEND_SELECTOR = "button[data-testid='send-button']";
 var POWER_CONTROL_SELECTOR2 = "[role='menuitem'][aria-label='Power']";
 var POWER_OPENER_SELECTOR = "form:has(#prompt-textarea) button.__composer-pill[aria-haspopup='menu']";
 var NEW_PAGE_READY_TIMEOUT_MS = 1e4;
+var SEND_ACTION_TIMEOUT_MS = 6e4;
 var ChatGPTBrowserPort = class {
   #env;
   #acknowledgementTimeoutMs;
@@ -2375,7 +2376,7 @@ var ChatGPTBrowserPort = class {
   #newChatPreflightTabId;
   constructor(env, options = {}) {
     this.#env = env;
-    this.#acknowledgementTimeoutMs = positive3(options.acknowledgementTimeoutMs, 5e3);
+    this.#acknowledgementTimeoutMs = positive3(options.acknowledgementTimeoutMs, 2e4);
     this.#attachmentTimeoutMs = positive3(options.attachmentTimeoutMs, 3e4);
     this.#artifactTimeoutMs = positive3(options.artifactTimeoutMs, 12e4);
     this.#pollMs = positive3(options.pollMs, 100);
@@ -3259,7 +3260,7 @@ async function activateExactPointerControl(page, control, label) {
 async function activateSend(page) {
   const send = await uniqueVisible2(page, SEND_SELECTOR, "ChatGPT Send control");
   if (send.click === void 0) throw new Error("ChatGPT Send control is not clickable.");
-  await send.click();
+  await send.click({ timeoutMs: SEND_ACTION_TIMEOUT_MS });
 }
 function readExactComposerPrompt(editor) {
   const tag = editor.tagName.toLowerCase();
